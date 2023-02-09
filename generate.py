@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 import torch
 import sys
+from tqdm import tqdm
 
 import utils.imgops as ops
 import utils.architecture.architecture as arch
@@ -27,6 +28,9 @@ parser.add_argument('--ishiiruka', action='store_true',
                     help='Save textures in the format used in Ishiiruka Dolphin material map texture packs')
 parser.add_argument('--ishiiruka_texture_encoder', action='store_true',
                     help='Save textures in the format used by Ishiiruka Dolphin\'s Texture Encoder tool')
+parser.add_argument('--no-normal', help='Do not generate normal maps', action="store_true")
+parser.add_argument('--no-other', help='Do not generate roughness and displacement maps', action="store_true")
+parser.add_argument('--skip-existing', help='Skip maps that were already generated', action="store_true")
 args = parser.parse_args()
 
 if not os.path.exists(args.input):
@@ -50,6 +54,9 @@ NORMAL_MAP_MODEL = 'utils/models/1x_NormalMapGenerator-CX-Lite_200000_G.pth'
 OTHER_MAP_MODEL = 'utils/models/1x_FrankenMapGenerator-CX-Lite_215000_G.pth'
 
 def process(img, model):
+    if model is None:
+        return None
+
     img = img * 1. / np.iinfo(img.dtype).max
     img = img[:, :, [2, 1, 0]]
     img = torch.from_numpy(np.transpose(img, (2, 0, 1))).float()
@@ -80,19 +87,50 @@ for root, _, files in os.walk(input_folder):
     for file in sorted(files, reverse=args.reverse):
         if file.split('.')[-1].lower() in ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'tiff', 'tga']:
             images.append(os.path.join(root, file))
-models = [
+models = []
+if not args.no_normal:
     # NORMAL MAP
-    load_model(NORMAL_MAP_MODEL), 
+    models.append(load_model(NORMAL_MAP_MODEL))
+if not args.no_other:
     # ROUGHNESS/DISPLACEMENT MAPS
-    load_model(OTHER_MAP_MODEL)
-    ]
-for idx, path in enumerate(images, 1):
+    models.append(load_model(OTHER_MAP_MODEL))
+
+if not models:
+    sys.exit('at least one model should be used')
+    
+for idx, path in enumerate(tqdm(images), 1):
     base = os.path.splitext(os.path.relpath(path, input_folder))[0]
     output_dir = os.path.dirname(os.path.join(output_folder, base))
     os.makedirs(output_dir, exist_ok=True)
-    print(idx, base)
+    print(idx, path)
+
+    local_models = models[:]
+
+    if not args.no_normal:
+        normal_name = '{:s}.nrm.png'.format(base) if args.ishiiruka else '{:s}_Normal.png'.format(base)
+        normal_file_path = os.path.join(output_folder, normal_name)
+        if args.skip_existing and os.path.exists(normal_file_path):
+            print('skipping already existing normal')
+            local_models[0] = None
+
+    if not args.no_other:
+        idx = 0 if args.no_normal else 1
+
+        rough_name = '{:s}.spec.png'.format(base) if args.ishiiruka else '{:s}_Roughness.png'.format(base)
+        rough_file_path = os.path.join(output_folder, rough_name)
+
+        displ_name = '{:s}.bump.png'.format(base) if args.ishiiruka else '{:s}_Displacement.png'.format(base)
+        displ_file_path = os.path.join(output_folder, displ_name)
+
+        if args.skip_existing and os.path.exists(rough_file_path) and os.path.exists(displ_file_path):
+            print('skipping already existing other')
+            local_models[idx] = None
+
+    if not [m for m in local_models if m is not None]:
+        continue
+
     # read image
-    try: 
+    try:
         img = cv2.imread(path, cv2.cv2.IMREAD_COLOR)
     except:
         img = cv2.imread(path, cv2.IMREAD_COLOR)
@@ -118,9 +156,16 @@ for idx, path in enumerate(images, 1):
     if args.seamless or args.mirror or args.replicate:
         rlts = [ops.crop_seamless(rlt) for rlt in rlts]
 
-    normal_map = rlts[0]
-    roughness = rlts[1][:, :, 1]
-    displacement = rlts[1][:, :, 0]
+    normal_map = None
+    if not args.no_normal:
+        normal_map = rlts[0]
+
+    roughness = None
+    displacement = None
+    if not args.no_other:
+        idx = 0 if args.no_normal else 1
+        roughness = rlts[idx][:, :, 1]
+        displacement = rlts[idx][:, :, 0]
 
     if args.ishiiruka_texture_encoder:
         r = 255 - roughness
@@ -130,12 +175,14 @@ for idx, path in enumerate(images, 1):
         output = cv2.merge((b, g, r, a))
         cv2.imwrite(os.path.join(output_folder, '{:s}.mat.png'.format(base)), output)
     else:
-        normal_name = '{:s}.nrm.png'.format(base) if args.ishiiruka else '{:s}_Normal.png'.format(base)
-        cv2.imwrite(os.path.join(output_folder, normal_name), normal_map)
+        if normal_map is not None:
+            normal_name = '{:s}.nrm.png'.format(base) if args.ishiiruka else '{:s}_Normal.png'.format(base)
+            normal_file_path = os.path.join(output_folder, normal_name)
+            cv2.imwrite(normal_file_path, normal_map)
 
-        rough_name = '{:s}.spec.png'.format(base) if args.ishiiruka else '{:s}_Roughness.png'.format(base)
-        rough_img = 255 - roughness if args.ishiiruka else roughness
-        cv2.imwrite(os.path.join(output_folder, rough_name), rough_img)
+        if roughness is not None:
+            rough_img = 255 - roughness if args.ishiiruka else roughness
+            cv2.imwrite(rough_file_path, rough_img)
 
-        displ_name = '{:s}.bump.png'.format(base) if args.ishiiruka else '{:s}_Displacement.png'.format(base)
-        cv2.imwrite(os.path.join(output_folder, displ_name), displacement)
+        if displacement is not None:
+            cv2.imwrite(displ_file_path, displacement)
